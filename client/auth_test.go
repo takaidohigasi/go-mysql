@@ -1,6 +1,7 @@
 package client
 
 import (
+	"crypto/sha1"
 	"net"
 	"testing"
 
@@ -109,4 +110,37 @@ func sendAuthResponse(t *testing.T, collation string) net.Conn {
 		require.NoError(t, err)
 	}()
 	return server
+}
+
+// TestSetNativePasswordStage1 covers the client-side stage1 option without a
+// server: length validation, the forced mysql_native_password plugin, the
+// response being identical to the plaintext path, and the refusal to answer
+// any other plugin's challenge.
+func TestSetNativePasswordStage1(t *testing.T) {
+	c := &Conn{}
+	require.Error(t, c.SetNativePasswordStage1(nil))
+	require.Error(t, c.SetNativePasswordStage1(make([]byte, 19)))
+	require.Error(t, c.SetNativePasswordStage1(make([]byte, 21)))
+
+	const plaintext = "s3cr3t"
+	stage1 := sha1.Sum([]byte(plaintext))
+	require.NoError(t, c.SetNativePasswordStage1(stage1[:]))
+	// The option copies its input.
+	stage1[0] ^= 0xff
+	require.NotEqual(t, stage1[:], c.nativePasswordStage1)
+	stage1[0] ^= 0xff
+
+	salt := []byte("12345678901234567890")
+	c.authPluginName = mysql.AUTH_NATIVE_PASSWORD
+	got, addNull, err := c.genAuthResponse(salt)
+	require.NoError(t, err)
+	require.False(t, addNull)
+	require.Equal(t, mysql.CalcNativePassword(salt, []byte(plaintext)), got)
+
+	for _, plugin := range []string{mysql.AUTH_CACHING_SHA2_PASSWORD, mysql.AUTH_SHA256_PASSWORD, mysql.AUTH_CLEAR_PASSWORD, mysql.AUTH_MARIADB_ED25519} {
+		c.authPluginName = plugin
+		_, _, err := c.genAuthResponse(salt)
+		require.Error(t, err, plugin)
+		require.Contains(t, err.Error(), plugin)
+	}
 }

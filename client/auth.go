@@ -157,9 +157,20 @@ func (c *Conn) readInitialHandshake() error {
 // here the \NUL needs to be added when sending back the empty password or cleartext password in 'sha256_password'
 // authentication.
 func (c *Conn) genAuthResponse(authData []byte) ([]byte, bool, error) {
+	// A stage1 hash can only answer mysql_native_password challenges; refuse
+	// anything else (including an auth switch away from native) instead of
+	// silently falling back to c.password, which the caller never had.
+	if c.nativePasswordStage1 != nil && c.authPluginName != mysql.AUTH_NATIVE_PASSWORD {
+		return nil, false, fmt.Errorf("native password stage1 hash can only authenticate with %s; server requested '%s'",
+			mysql.AUTH_NATIVE_PASSWORD, c.authPluginName)
+	}
+
 	// password hashing
 	switch c.authPluginName {
 	case mysql.AUTH_NATIVE_PASSWORD:
+		if c.nativePasswordStage1 != nil {
+			return mysql.CalcNativePasswordFromStage1(authData[:20], c.nativePasswordStage1), false, nil
+		}
 		return mysql.CalcNativePassword(authData[:20], []byte(c.password)), false, nil
 	case mysql.AUTH_CACHING_SHA2_PASSWORD:
 		return mysql.CalcCachingSha2Password(authData, []byte(c.password)), false, nil
@@ -209,6 +220,14 @@ func (c *Conn) genAttributes() []byte {
 
 // See: http://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse
 func (c *Conn) writeAuthHandshake() error {
+	// With a stage1 hash we must open with mysql_native_password regardless
+	// of the server's advertised default (MySQL 8 advertises
+	// caching_sha2_password). The server then either accepts it or sends an
+	// auth switch to the account's real plugin, which genAuthResponse rejects.
+	if c.nativePasswordStage1 != nil {
+		c.authPluginName = mysql.AUTH_NATIVE_PASSWORD
+	}
+
 	if !authPluginAllowed(c.authPluginName) {
 		return fmt.Errorf("unknown auth plugin name '%s'", c.authPluginName)
 	}

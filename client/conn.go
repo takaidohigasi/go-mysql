@@ -35,6 +35,10 @@ type Conn struct {
 	tlsConfig *tls.Config
 	proto     string
 
+	// nativePasswordStage1, when set, replaces password for
+	// mysql_native_password authentication. See SetNativePasswordStage1.
+	nativePasswordStage1 []byte
+
 	// Connection read and write timeouts to set on the connection
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -271,6 +275,32 @@ func (c *Conn) UseSSL(insecureSkipVerify bool) {
 // pass to options when connect
 func (c *Conn) SetTLSConfig(config *tls.Config) {
 	c.tlsConfig = config
+}
+
+// SetNativePasswordStage1 authenticates with the mysql_native_password
+// stage1 hash (SHA1(password), 20 bytes) instead of the plaintext password.
+// Pass it as an Option when connecting:
+//
+//	client.Connect(addr, user, "", db, func(c *client.Conn) error {
+//		return c.SetNativePasswordStage1(stage1)
+//	})
+//
+// The client then announces mysql_native_password in the handshake response
+// and answers the challenge via mysql.CalcNativePasswordFromStage1. If the
+// server insists on a different auth plugin (auth switch to
+// caching_sha2_password, sha256_password, ...) the connection fails, because
+// those plugins cannot be satisfied from a SHA1 stage1 hash.
+//
+// Intended for proxies that recovered the stage1 hash from an inbound
+// handshake (server.Conn.NativePasswordStage1) and need to connect to the
+// upstream server as the same user without ever holding the plaintext — the
+// mechanism ProxySQL uses for hashed passwords. The hash is copied.
+func (c *Conn) SetNativePasswordStage1(stage1 []byte) error {
+	if len(stage1) != mysql.NativePasswordStage1Len {
+		return errors.Errorf("native password stage1 hash must be %d bytes, got %d", mysql.NativePasswordStage1Len, len(stage1))
+	}
+	c.nativePasswordStage1 = slices.Clone(stage1)
+	return nil
 }
 
 func (c *Conn) UseDB(dbName string) error {
