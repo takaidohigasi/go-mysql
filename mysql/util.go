@@ -37,12 +37,31 @@ func CalcNativePassword(scramble, password []byte) []byte {
 	}
 
 	// stage1Hash = SHA1(password)
-	crypt := sha1.New()
-	crypt.Write(password)
-	stage1 := crypt.Sum(nil)
+	stage1 := sha1.Sum(password)
+	return CalcNativePasswordFromStage1(scramble, stage1[:])
+}
+
+// NativePasswordStage1Len is the length in bytes of a mysql_native_password
+// stage1 hash (SHA1(password)) and of the stored hash (SHA1(SHA1(password))).
+const NativePasswordStage1Len = sha1.Size
+
+// CalcNativePasswordFromStage1 builds the mysql_native_password challenge
+// response from the stage1 hash (SHA1(password)) instead of the plaintext:
+//
+//	token = SHA1(scramble + SHA1(stage1)) XOR stage1
+//
+// CalcNativePassword is this function applied to SHA1(password). It exists for
+// callers that hold only the stage1 hash, e.g. a proxy that recovered it from
+// an inbound handshake via RecoverNativePasswordStage1 and wants to
+// authenticate to an upstream server with the same credential (the approach
+// ProxySQL uses for hashed passwords). Returns nil for an empty stage1.
+func CalcNativePasswordFromStage1(scramble, stage1 []byte) []byte {
+	if len(stage1) == 0 {
+		return nil
+	}
 
 	// stage2Hash = SHA1(stage1Hash)
-	crypt.Reset()
+	crypt := sha1.New()
 	crypt.Write(stage1)
 	stage2 := crypt.Sum(nil)
 
@@ -111,18 +130,42 @@ func NativePasswordHash(password []byte) []byte {
 }
 
 func CompareNativePassword(reply []byte, stored []byte, seed []byte) bool {
+	_, ok := RecoverNativePasswordStage1(reply, seed, stored)
+	return ok
+}
+
+// RecoverNativePasswordStage1 verifies a mysql_native_password challenge
+// response against the stored hash (SHA1(SHA1(password)), i.e. what
+// mysql.user.authentication_string holds) and, when it matches, returns the
+// stage1 hash SHA1(password) that the client proved knowledge of:
+//
+//	stage1 = reply XOR SHA1(seed + stored)
+//	ok     = SHA1(stage1) == stored
+//
+// The stage1 hash is password-equivalent for mysql_native_password: it is all
+// a client needs to answer any future challenge (see
+// CalcNativePasswordFromStage1), so callers must protect it like the
+// plaintext. It is only ever derivable by a party that already holds the
+// stored hash, which is why a proxy configured with just the hash can
+// re-authenticate to an upstream server on the client's behalf.
+//
+// Returns (nil, false) when stored is empty or the reply does not match.
+func RecoverNativePasswordStage1(reply, seed, stored []byte) ([]byte, bool) {
 	if len(stored) == 0 {
-		return false
+		return nil, false
 	}
 
 	// hash_stage1 = xor(reply, sha1(public_seed, hash_stage2))
 	stage1 := stage1FromReply(reply, seed, stored)
-	// andidate_hash2 = sha1(hash_stage1)
+	// candidate_hash2 = sha1(hash_stage1)
 	stage2 := sha1.Sum(stage1)
 
 	// check(candidate_hash2 == hash_stage2)
 	// use ConstantTimeCompare to mitigate timing based attacks
-	return subtle.ConstantTimeCompare(stage2[:], stored) == 1
+	if subtle.ConstantTimeCompare(stage2[:], stored) != 1 {
+		return nil, false
+	}
+	return stage1, true
 }
 
 // CalcCachingSha2Password: Hash password using MySQL 8+ method (SHA256)

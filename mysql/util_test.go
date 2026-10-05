@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"crypto/sha1"
 	"testing"
 	"time"
 
@@ -128,4 +129,61 @@ func TestToBinaryDateTime(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCalcNativePasswordFromStage1 confirms the stage1-based response is
+// byte-identical to the plaintext-based one for the same scramble, so a
+// caller holding only SHA1(password) produces exactly what a normal client
+// would send.
+func TestCalcNativePasswordFromStage1(t *testing.T) {
+	seed := []byte("12345678901234567890")
+	for _, pw := range []string{"a", "secret", "a much longer password with spaces"} {
+		stage1 := sha1.Sum([]byte(pw))
+		require.Equal(t,
+			CalcNativePassword(seed, []byte(pw)),
+			CalcNativePasswordFromStage1(seed, stage1[:]),
+			"password %q", pw)
+	}
+	require.Nil(t, CalcNativePasswordFromStage1(seed, nil))
+	require.Nil(t, CalcNativePasswordFromStage1(seed, []byte{}))
+}
+
+// TestRecoverNativePasswordStage1 covers the server side: a valid reply
+// yields SHA1(password) and true; a reply for a different password, an
+// empty stored hash, or a garbage reply yields (nil, false). It also checks
+// the recovered value re-authenticates against a fresh scramble, which is
+// the property proxies rely on.
+func TestRecoverNativePasswordStage1(t *testing.T) {
+	seed := []byte("12345678901234567890")
+	pw := []byte("secret")
+	stored := NativePasswordHash(pw)
+	reply := CalcNativePassword(seed, pw)
+
+	stage1, ok := RecoverNativePasswordStage1(reply, seed, stored)
+	require.True(t, ok)
+	want := sha1.Sum(pw)
+	require.Equal(t, want[:], stage1)
+
+	// CompareNativePassword must agree with the recovery result.
+	require.True(t, CompareNativePassword(reply, stored, seed))
+
+	// The recovered stage1 answers a different challenge correctly.
+	seed2 := []byte("abcdefghijklmnopqrst")
+	require.True(t, CompareNativePassword(CalcNativePasswordFromStage1(seed2, stage1), stored, seed2))
+
+	// Wrong password.
+	s, ok := RecoverNativePasswordStage1(CalcNativePassword(seed, []byte("wrong")), seed, stored)
+	require.False(t, ok)
+	require.Nil(t, s)
+	require.False(t, CompareNativePassword(CalcNativePassword(seed, []byte("wrong")), stored, seed))
+
+	// Empty stored hash never matches.
+	s, ok = RecoverNativePasswordStage1(reply, seed, nil)
+	require.False(t, ok)
+	require.Nil(t, s)
+
+	// Truncated / garbage reply.
+	s, ok = RecoverNativePasswordStage1([]byte{1, 2, 3}, seed, stored)
+	require.False(t, ok)
+	require.Nil(t, s)
 }
