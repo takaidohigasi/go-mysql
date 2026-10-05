@@ -86,8 +86,12 @@ func (c *Conn) compareNativePasswordAuthData(clientAuthData []byte, credential C
 	// Pre-computed hashes are checked first: they let callers configure
 	// credentials when only the server-side hash is available (no plaintext),
 	// and they're cheaper per connect because we skip the SHA1(SHA1(...)) step.
+	// On a match we also keep the recovered stage1 hash (SHA1(password))
+	// so embedding applications can re-authenticate as this user without
+	// the plaintext; see Conn.NativePasswordStage1.
 	for _, hp := range credential.HashedPasswords {
-		if mysql.CompareNativePassword(clientAuthData, hp.data, c.salt) {
+		if stage1, ok := mysql.RecoverNativePasswordStage1(clientAuthData, c.salt, hp.data); ok {
+			c.nativePasswordStage1 = stage1
 			return nil
 		}
 	}
@@ -101,7 +105,8 @@ func (c *Conn) compareNativePasswordAuthData(clientAuthData []byte, credential C
 		if err != nil {
 			continue
 		}
-		if mysql.CompareNativePassword(clientAuthData, decoded, c.salt) {
+		if stage1, ok := mysql.RecoverNativePasswordStage1(clientAuthData, c.salt, decoded); ok {
+			c.nativePasswordStage1 = stage1
 			return nil
 		}
 	}

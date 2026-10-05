@@ -2,13 +2,17 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"database/sql"
 	"log/slog"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
 	_ "github.com/go-mysql-org/go-mysql/driver"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/test_util/test_keys"
@@ -714,4 +718,131 @@ func TestOnAuthFailureCalled(t *testing.T) {
 	require.Error(t, db.Ping())
 	require.Equal(t, int32(0), handler.onSuccessCalled.Load())
 	require.Equal(t, int32(1), handler.onFailureCalled.Load())
+}
+
+// stage1CaptureHandler records the stage1 hash the server recovered for the
+// most recent successful handshake, mimicking what a proxy would do right
+// after NewCustomizedConn returns.
+type stage1CaptureHandler struct {
+	*InMemoryAuthenticationHandler
+	mu     sync.Mutex
+	stage1 []byte
+}
+
+func (h *stage1CaptureHandler) OnAuthSuccess(conn *Conn) error {
+	h.mu.Lock()
+	h.stage1 = conn.NativePasswordStage1()
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *stage1CaptureHandler) last() []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stage1
+}
+
+// serveWith accepts connections on a fresh listener and runs the handshake +
+// command loop against handler. It returns the listener address.
+func serveWith(t *testing.T, handler AuthenticationHandler) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			conn, acceptErr := l.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				co, _ := NewDefaultServer().NewCustomizedConn(c, handler, &EmptyHandler{})
+				if co != nil {
+					for co.HandleCommand() == nil {
+					}
+				}
+			}(conn)
+		}
+	}()
+	return l.Addr().String()
+}
+
+// TestNativePasswordStage1Passthrough is the ProxySQL-style flow end to end,
+// in-process: server A knows only the stored hash of alice's password, a
+// client logs in with the plaintext, A recovers SHA1(plaintext) from the
+// reply, and that stage1 hash alone is enough to authenticate to server B
+// (which also holds only the stored hash). No party other than the client
+// ever sees the plaintext.
+func TestNativePasswordStage1Passthrough(t *testing.T) {
+	const plaintext = "s3cr3t"
+	stored := mysql.NativePasswordHash([]byte(plaintext))
+
+	handlerA := &stage1CaptureHandler{InMemoryAuthenticationHandler: NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)}
+	require.NoError(t, handlerA.AddUserWithHashedPassword("alice", stored))
+	addrA := serveWith(t, handlerA)
+
+	handlerB := NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
+	require.NoError(t, handlerB.AddUserWithHashedPassword("alice", stored))
+	addrB := serveWith(t, handlerB)
+
+	// 1. Inbound: plaintext login against A.
+	inbound, err := client.Connect(addrA, "alice", plaintext, "")
+	require.NoError(t, err)
+	defer inbound.Close()
+
+	stage1 := handlerA.last()
+	want := sha1.Sum([]byte(plaintext))
+	require.Equal(t, want[:], stage1, "server must recover SHA1(plaintext) on a hashed-credential match")
+
+	// 2. Outbound: stage1 only, no plaintext, against B.
+	outbound, err := client.Connect(addrB, "alice", "", "", func(c *client.Conn) error {
+		return c.SetNativePasswordStage1(stage1)
+	})
+	require.NoError(t, err)
+	defer outbound.Close()
+	// EmptyHandler rejects queries, so a successful handshake (and the
+	// server-side UseDB during it) is the whole outbound check.
+
+	// 3. A wrong stage1 is denied like a wrong password.
+	bad := slices.Clone(stage1)
+	bad[0] ^= 0xff
+	_, err = client.Connect(addrB, "alice", "", "", func(c *client.Conn) error {
+		return c.SetNativePasswordStage1(bad)
+	})
+	require.Error(t, err)
+
+	// 4. A plaintext-registered user also yields the stage1 hash — the
+	//    recovery does not depend on how the server stored the credential.
+	handlerA.InMemoryAuthenticationHandler = NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
+	require.NoError(t, handlerA.AddUser("alice", plaintext))
+	c2, err := client.Connect(addrA, "alice", plaintext, "")
+	require.NoError(t, err)
+	c2.Close()
+	require.Equal(t, want[:], handlerA.last())
+
+	// 5. An empty-password login leaves it nil.
+	handlerA.InMemoryAuthenticationHandler = NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
+	require.NoError(t, handlerA.AddUser("nopw", ""))
+	c3, err := client.Connect(addrA, "nopw", "", "")
+	require.NoError(t, err)
+	c3.Close()
+	require.Nil(t, handlerA.last())
+}
+
+// TestNativePasswordStage1RejectsAuthSwitch confirms a stage1-only client
+// fails cleanly (rather than sending garbage or falling back to an empty
+// password) when the server's account uses a plugin other than
+// mysql_native_password and therefore sends an auth switch.
+func TestNativePasswordStage1RejectsAuthSwitch(t *testing.T) {
+	const plaintext = "s3cr3t"
+	handler := NewInMemoryAuthenticationHandler(mysql.AUTH_CACHING_SHA2_PASSWORD)
+	require.NoError(t, handler.AddUser("alice", plaintext))
+	addr := serveWith(t, handler)
+
+	stage1 := sha1.Sum([]byte(plaintext))
+	_, err := client.Connect(addr, "alice", "", "", func(c *client.Conn) error {
+		return c.SetNativePasswordStage1(stage1[:])
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), mysql.AUTH_CACHING_SHA2_PASSWORD)
 }

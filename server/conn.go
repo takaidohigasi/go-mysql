@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -28,6 +29,10 @@ type Conn struct {
 	user                string
 	credential          Credential
 	cachingSha2FullAuth bool
+	// nativePasswordStage1 is SHA1(password) recovered from a successful
+	// mysql_native_password handshake; nil otherwise. See
+	// NativePasswordStage1.
+	nativePasswordStage1 []byte
 
 	h Handler
 
@@ -139,6 +144,21 @@ func (c *Conn) Closed() bool {
 
 func (c *Conn) GetUser() string {
 	return c.user
+}
+
+// NativePasswordStage1 returns a copy of the stage1 hash (SHA1(password))
+// that the client proved knowledge of during a mysql_native_password
+// handshake, or nil if the connection authenticated with an empty password,
+// through a different auth plugin, or has not authenticated.
+//
+// For mysql_native_password the stage1 hash is password-equivalent: with it
+// (and nothing else) a client can answer any challenge, see
+// mysql.CalcNativePasswordFromStage1. Treat it like the plaintext. The
+// intended use is a proxy that is configured with only the stored hash
+// (Credential.HashedPasswords) and needs to open an outbound connection as
+// the same user — the approach ProxySQL takes for hashed passwords.
+func (c *Conn) NativePasswordStage1() []byte {
+	return slices.Clone(c.nativePasswordStage1)
 }
 
 func (c *Conn) Capability() uint32 {
